@@ -1,11 +1,12 @@
 from __future__ import  annotations
-from typing import Union, Dict, Any
+from typing import Union, Dict, Any, List, Iterable
 from enum import Enum
 from datetime import datetime
 from dataclasses import dataclass
 import re
 
 class RCJobStatus(Enum):
+    NOT_STARTED:int = -1
     IN_PROGRESS:int = 0
     FINISHED:int = 1
     FAILED:int = 2
@@ -71,16 +72,24 @@ class RCloneJob:
     @classmethod
     def from_json(cls, json_data:Dict) -> RCloneJob:
         d = cls._get_data_from_json(json_data)
-        return RCloneJob(**d)
+        return cls(**d)
 
 
 @dataclass(frozen=True)
 class RCloneTransferJob(RCloneJob):
+    '''
+    This class collects detailed information about a job that is transferring a file
+    '''
+
     transferred_bytes:int = 0
     filename:str = ""
     size:int = 0
     speed:float = 0.
     average_speed:float = 0.
+
+    @property
+    def percentage(this)->float:
+        return this.transferred_bytes/this.size
 
     @classmethod
     def _get_data_from_json(cls, json_data: Dict) -> Dict[str | Any]:
@@ -93,3 +102,46 @@ class RCloneTransferJob(RCloneJob):
             "average_speed" : json_data.pop('speedAvg'),
             **job_data
         }
+
+
+class RCloneTransferDetails:
+    '''
+    This object collects the transfer information of many jobs, making easy to gather global information
+    '''
+
+    def __init__(this, jobs:List[RCloneTransferJob]):
+        this._jobs=jobs
+
+    def __len__(this) -> int:
+        return len(this._jobs)
+    def __getitem__(this, index:int) -> RCloneTransferJob:
+        '''
+        Return the job at the provided position
+        :param index: Job index
+        :return: A RCloneTransferJob
+        '''
+
+        return this._jobs[index]
+
+    def __iter__(this) -> Iterable[RCloneTransferJob]:
+        return iter(this._jobs)
+
+    @property
+    def percentage(this) -> float:
+
+        transf = 0
+        total = 0
+
+        for job in this:
+            transf+=job.transferred_bytes
+            total+=job.size
+
+        return transf/total
+
+    @property
+    def total_transfer_speed(this) -> float:
+        return sum([job.speed for job in this])
+
+    @property
+    def total_average_transfer_speed(this) -> float:
+        return sum([job.average_speed for job in this])

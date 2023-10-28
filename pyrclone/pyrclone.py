@@ -1,9 +1,9 @@
 import asyncio
 
-from typing_extensions import Self
-from typing import Union, List, Any
-from pyrclone.auth import RCloneAuthenticator
-from pyrclone.jobs import RCloneJob, RCloneTransferJob
+from typing_extensions import Self, AsyncIterable
+from typing import Union, Dict, Any, List
+from auth import RCloneAuthenticator
+from jobs import RCloneJob, RCloneTransferJob, RCJobStatus, RCloneTransferDetails
 from subprocess import Popen, PIPE
 from aiohttp import ClientSession, BasicAuth, ClientResponseError
 import json
@@ -47,7 +47,7 @@ class rclone:
 
         this._running_server:Union[Popen|None]=None
         this._session: Union[ClientSession|None] = None
-        this._pending_jobs:List[int] = []
+        this._managed_jobs:Dict[int:Union[RCloneTransferJob|None]] = {}
 
     async def __aenter__(this) -> Self:
         await this.run()
@@ -94,7 +94,7 @@ class rclone:
             else:
                 raise ClientResponseError(response.request_info, response.history, message=content)
 
-    async def ls(this, root:str, path:str) -> Any:
+    async def ls(this, root:str, path:str, recursive:bool=False) -> Any:
         '''
         Return the list of files within root at the given Path
 
@@ -103,14 +103,21 @@ class rclone:
 
         :param root: An RClone remote or a local path
         :param path: a path relative from root
+        :param recursive: If TRUE, runs a recursive listing of all files in root/path
         :return: A list containing the content of the directory
         '''
+
+        opt = {}
+
+        if recursive:
+            opt['recurse'] = True
 
         try:
             data = await this.make_request("operations",
                                            "list",
                                            fs=root,
-                                           remote=path)
+                                           remote=path,
+                                           opt=opt)
             return data['list']
 
         except ClientResponseError as err:
@@ -118,6 +125,32 @@ class rclone:
                 raise FileNotFoundError(f"{os.path.join(root,path)} was not found")
             else:
                 raise err
+
+    async def exists(this, root: str, path: str) -> bool:
+        '''
+        Check if the provided file/directory exists
+
+        :param root: An RClone remote or a local path
+        :param path: a path relative from root
+        :return: TRUE if the file exists, FALSE otherwise
+        '''
+
+        return (await this.stat(root,path)) is not None
+
+    async def stat(this, root:str, path:str) -> Any:
+        '''
+        Give information about the supplied file or directory
+
+        :param root: An RClone remote or a local path
+        :param path: a path relative from root
+        :return: A json containing information about the file/directory, None otherwise
+        '''
+
+        data = await this.make_request("operations",
+                                       "stat",
+                                           fs=root,
+                                           remote=path)
+        return data['item']
 
     async def list_remotes(this):
         '''
@@ -138,6 +171,15 @@ class rclone:
         return remotes
 
     async def copy_file(this, src_root, src_path, dst_root,dst_path) -> int:
+        '''
+        Copy a file
+
+        :param src_root: Source root path
+        :param src_path: Source path to filename
+        :param dst_root: Destination root path
+        :param dst_path: Destination path to filename
+        :return:
+        '''
         request_data={
                     "srcFs": src_root,
                     "srcRemote" : src_path,
@@ -146,31 +188,149 @@ class rclone:
                     "_async" : "true"
         }
 
-        response = this.make_request("operations","copyfile", **request_data)
+        response = await this.make_request("operations","copyfile", **request_data)
 
         id = response['jobid']
-        this._pending_jobs.append(id)
+        this._managed_jobs[id] = None
 
         return id
 
+    async def rmdir(this, root:str, path:str) -> Self:
+        '''
+        Delete the provided directory (it must be empty)
+
+        :param root: An RClone remote or a local path
+        :param path: a path relative from root
+        :return: This object
+        '''
+
+        await this.make_request("operations",
+                                "rmdir",
+                                         fs=root,
+                                         remote=path)
+        return this
+
+    async def delete_file(this, root:str, path:str) -> Self:
+        '''
+        Delete a specific file
+
+        :param root: An RClone remote or a local path
+        :param path: a path relative from root
+        :return: This object
+        '''
+
+        await this.make_request("operations",
+                                "deletefile",
+                                         fs=root,
+                                         remote=path)
+        return this
     async def get_job_status(this, id:int) -> RCloneJob:
+        '''
+        Get the status of a job (either pending or terminated)
+
+        :param id: The id of the job
+        :return: An RCloneJob object
+        '''
         response = await this.make_request("job","status",jobid=id)
 
         return RCloneJob.from_json(response)
 
     async def get_transfer_status(this, id: int) -> RCloneTransferJob:
+        '''
+        Get the status of a job that is transferring a file
+        Differently than the `get_job_status`, this method retrieves more detailed information about the file
+        transferring, such as bytes transferred, transfer speed, etc.
+
+        :param id: Job id to get the information from
+        :return: An RCloneTransferJob object
+        '''
         response_status = await this.make_request("job", "status", jobid=id)
         response_stats = await this.make_request("core", "stats", group=f"job/{id}")
 
-        d = {**response_status, **response_stats}
+        d = {**response_status, **response_stats['transferring'][0]}
 
         return RCloneTransferJob.from_json(d)
 
     @property
-    async def jobs(this):
-        for id in this._pending_jobs:
-            yield this.get_transfer_status(id)
+    def jobid_to_be_started(this) -> List[int]:
+        return [jobid for jobid,jobstatus in this._managed_jobs.items() if jobstatus is None]
 
+    @property
+    async def started_jobs(this) -> AsyncIterable[RCloneTransferJob]:
+        '''
+        Gets all the jobs currently managed
+
+        :return: This method is an async iterable
+        '''
+        for id in this._managed_jobs:
+            try:
+                job_status = await this.get_transfer_status(id)
+                this._managed_jobs[id] = job_status
+                yield job_status
+            except KeyError: # this is raised when either the job hasn't started yet OR has finished
+                ...
+
+    @property
+    async def jobs_in_progress(this) -> AsyncIterable[RCloneTransferJob]:
+        '''
+        Gets the list of all pending jobs
+
+        :return: This method is an async iterable
+        '''
+        async for job in this.started_jobs:
+            if job.status == RCJobStatus.IN_PROGRESS:
+                yield job
+
+    @property
+    async def terminated_jobs(this) -> AsyncIterable[RCloneTransferJob]:
+        '''
+        Gets the list of all terminated jobs (either successful or not)
+
+        :return: This method is an async iterable
+        '''
+
+        async for job in this.started_jobs:
+            if job.status != RCJobStatus.IN_PROGRESS:
+                yield job
+    async def clean_terminated_jobs(this) -> Self:
+        '''
+        Clean the terminated jobs from the cache
+
+        :return: This object
+        '''
+
+        this._managed_jobs = [job.id async for job in this.jobs_in_progress]
+        return this
+
+    async def stop_job(this, jobid:int) -> bool:
+        '''
+        Allows to stop a specific job
+        :param jobid: The job id to stop
+
+        :return: TRUE if successful, FALSE otherwise
+        '''
+        response = await this.make_request("job","stop",jobid=jobid)
+
+        return response.status == 200
+    async def stop_pending_jobs(this) -> Self:
+        '''
+        Stop all pending jobs
+
+        :return: This object
+        '''
+        async for job in this.jobs_in_progress:
+            await this.stop_job(job.id)
+
+        return this
+
+    async def get_pending_jobs_progress(this) -> RCloneTransferDetails:
+        '''
+        Returns an agglomerate statistics of all pending jobs
+        :return: This information is managed within the class RCloneTransferDetails
+        '''
+
+        jobs = [job async for job in this.started_jobs]
+        return RCloneTransferDetails(jobs)
 
     async def run(this) -> Self:
         '''
