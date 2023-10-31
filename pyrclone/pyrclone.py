@@ -2,10 +2,10 @@ import asyncio
 
 from typing_extensions import Self, AsyncIterable
 from typing import Union, Dict, Any, List
-from auth import RCloneAuthenticator
-from jobs import RCloneJob, RCloneTransferJob, RCJobStatus, RCloneTransferDetails
 from subprocess import Popen, PIPE
 from aiohttp import ClientSession, BasicAuth, ClientResponseError
+from .auth import RCloneAuthenticator
+from .jobs import RCloneJob, RCloneTransferJob, RCJobStatus, RCloneTransferDetails
 import json
 import os
 
@@ -111,6 +111,8 @@ class rclone:
 
         if recursive:
             opt['recurse'] = True
+
+        path = path.lstrip("./") # rclone doesn't like paths startign with . or / (or both!)
 
         try:
             data = await this.make_request("operations",
@@ -332,9 +334,11 @@ class rclone:
         jobs = [job async for job in this.started_jobs]
         return RCloneTransferDetails(jobs)
 
-    async def run(this) -> Self:
+    def run(this) -> Self:
         '''
         Run the rclone remote control daemon
+        This method is intentionally blocking
+
         :return: The object itself
         '''
         cmd = [
@@ -352,8 +356,6 @@ class rclone:
         this._running_server = this._running_server = Popen(
             cmd , stdin=PIPE, stdout=PIPE, stderr=PIPE
         )
-
-        await asyncio.sleep(0.1)
 
         return this
 
