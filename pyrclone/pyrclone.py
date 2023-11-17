@@ -1,11 +1,12 @@
 import asyncio
 
 from typing_extensions import Self, AsyncIterable
-from typing import Union, Dict, Any, List
+from typing import Union, Tuple, Any, List, Dict
 from subprocess import Popen, PIPE
 from aiohttp import ClientSession, BasicAuth, ClientResponseError
+from aiohttp.client_exceptions import ClientConnectorError
 from .auth import RCloneAuthenticator
-from .jobs import RCloneJob, RCloneTransferJob, RCJobStatus, RCloneTransferDetails
+from .jobs import RCloneJob, RCloneJobStats, RCJobStatus
 import json
 import os
 
@@ -47,10 +48,11 @@ class rclone:
 
         this._running_server: Union[Popen | None] = None
         this._session: Union[ClientSession | None] = None
-        this._managed_jobs: Dict[int:Union[RCloneTransferJob | None]] = {}
+        this._transferring_jobs:List[int] = []
+        this._transferring_jobs_last_update:Dict[int,Union[RCloneJob|None]] = dict()
 
     async def __aenter__(this) -> Self:
-        await this.run()
+        this.run()
         return this
 
     async def __aexit__(this, exc_type, exc_val, exc_tb) -> bool:
@@ -221,7 +223,7 @@ class rclone:
         response = await this.make_request("operations", "copyfile", **request_data)
 
         id = response['jobid']
-        this._managed_jobs[id] = None
+        this._transferring_jobs.append(id)
 
         return id
 
@@ -259,19 +261,80 @@ class rclone:
                                 _async=asynch)
         return this
 
+    @property
+    async def jobs(this) -> AsyncIterable[Tuple[int,RCJobStatus]]:
+
+        for jobid in this._transferring_jobs:
+            this._transferring_jobs_last_update.setdefault(jobid,None)
+
+            try:
+                job_status = await this.get_job_status(jobid)
+                this._transferring_jobs_last_update[jobid] = job_status.stats
+            except ClientResponseError:
+                job_status = this._transferring_jobs_last_update[jobid]
+
+            status = job_status.status
+
+            yield jobid,status
+
+
+
+
+
+
+        # not_started = this._transferring_jobs[RCJobStatus.NOT_STARTED].copy()
+        # in_progress = this._transferring_jobs[RCJobStatus.IN_PROGRESS].copy()
+        # finished = this._transferring_jobs[RCJobStatus.FINISHED].copy()
+        #
+        #
+        # for id in not_started:
+        #     update = await this.get_job_status(id)
+        #     if update.stats is not None:
+        #         this._transferring_jobs[RCJobStatus.IN_PROGRESS][id] = update
+        #         this._transferring_jobs[RCJobStatus.NOT_STARTED].remove(id)
+        #     else:
+        #         yield id, RCJobStatus.NOT_STARTED
+        #
+        # for id in in_progress.keys():
+        #     update = await this.get_job_status(id)
+        #     this._transferring_jobs[RCJobStatus.IN_PROGRESS][id] = update
+        #
+        #     if update.status == RCJobStatus.IN_PROGRESS:
+        #         yield id, RCJobStatus.IN_PROGRESS
+        #     else:
+        #         last_update = this._transferring_jobs[RCJobStatus.IN_PROGRESS][id]
+        #         del this._transferring_jobs[RCJobStatus.IN_PROGRESS][id]
+        #         this._transferring_jobs[RCJobStatus.FINISHED][id] = last_update
+        #
+        # for id,last_update in finished.items():
+        #     try:
+        #         last_update = await this.get_job_status(id)
+        #         this._transferring_jobs[RCJobStatus.FINISHED][id] = last_update
+        #     except ClientResponseError:
+        #         ...
+        #
+        #     yield id,last_update.status
+
+    async def has_finished(this) -> bool:
+        async for id,status in this.jobs:
+            if status not in [RCJobStatus.FINISHED, RCJobStatus.FAILED]:
+                return False
+
+        return True
+
+    # async def get_job_status(this, id: int) -> RCloneJob:
+    #     '''
+    #     Get the status of a job (either pending or terminated)
+    #
+    #     :param id: The id of the job
+    #     :return: An RCloneJob object
+    #     '''
+    #
+    #     response = await this.make_request("job", "status", jobid=id)
+    #
+    #     return RCloneJob.from_json(response)
+
     async def get_job_status(this, id: int) -> RCloneJob:
-        '''
-        Get the status of a job (either pending or terminated)
-
-        :param id: The id of the job
-        :return: An RCloneJob object
-        '''
-
-        response = await this.make_request("job", "status", jobid=id)
-
-        return RCloneJob.from_json(response)
-
-    async def get_transfer_status(this, id: int) -> RCloneTransferJob:
         '''
         Get the status of a job that is transferring a file
         Differently than the `get_job_status`, this method retrieves more detailed information about the file
@@ -281,71 +344,103 @@ class rclone:
         :return: An RCloneTransferJob object
         '''
         response_status = await this.make_request("job", "status", jobid=id)
+        job = RCloneJob.from_json(response_status)
+
         response_stats = await this.make_request("core", "stats", group=f"job/{id}")
 
-        d = {**response_status, **response_stats['transferring'][0]}
+        if 'transferring' in response_stats.keys():
+            stats = RCloneJobStats.from_json(response_stats['transferring'][0])
+            job.stats = stats
 
-        return RCloneTransferJob.from_json(d)
+        return job
 
-    async def has_finished(this) -> bool:
-        for _ in  this.jobid_to_be_started:
-            return False
+    def get_last_status_update(this, jobid) -> Union[RCloneJobStats | None]:
+        return this._transferring_jobs_last_update[jobid] if jobid in this._transferring_jobs_last_update.keys() else None
 
-        async for _ in this.jobs_in_progress:
-            return False
-
-        return True
-
-    @property
-    def jobid_to_be_started(this) -> List[int]:
-        return [jobid for jobid, jobstatus in this._managed_jobs.items() if jobstatus is None]
-
-    @property
-    async def started_jobs(this) -> AsyncIterable[RCloneTransferJob]:
-        '''
-        Gets all the jobs currently managed
-
-        :return: This method is an async iterable
-        '''
-        for id in this._managed_jobs:
-            try:
-                job_status = await this.get_transfer_status(id)
-                this._managed_jobs[id] = job_status
-                yield job_status
-            except KeyError:  # this is raised when either the job hasn't started yet OR has finished
-                ...
-
-    @property
-    async def jobs_in_progress(this) -> AsyncIterable[RCloneTransferJob]:
-        '''
-        Gets the list of all pending jobs
-
-        :return: This method is an async iterable
-        '''
-        async for job in this.started_jobs:
-            if job.status == RCJobStatus.IN_PROGRESS:
-                yield job
-
-    @property
-    async def terminated_jobs(this) -> AsyncIterable[RCloneTransferJob]:
-        '''
-        Gets the list of all terminated jobs (either successful or not)
-
-        :return: This method is an async iterable
-        '''
-
-        async for job in this.started_jobs:
-            if job.status != RCJobStatus.IN_PROGRESS:
-                yield job
-
-    async def clean_terminated_jobs(this) -> Self:
+    #
+    # async def has_finished(this) -> bool:
+    #     for _ in  this.jobid_to_be_started:
+    #         return False
+    #
+    #     async for _ in this.jobs_in_progress:
+    #         return False
+    #
+    #     return True
+    #
+    # @property
+    # async def jobid_to_be_started(this) -> AsyncIterable[int]:
+    #     for id in this._managed_jobs:
+    #         try:
+    #             job_status = await this.get_transfer_status(id)
+    #             this._managed_jobs[id] = job_status
+    #         except KeyError:  # this is raised when either the job hasn't started yet OR has finished
+    #             yield id
+    #         except ClientResponseError as err:
+    #             response = json.loads(err.message)
+    #             if response['error'] != "job not found": # this can happen when tthe job has finished for a while
+    #                 raise err
+    #
+    #
+    # @property
+    # async def started_jobs(this) -> AsyncIterable[RCloneTransferJob]:
+    #     '''
+    #     Gets all the jobs currently managed
+    #
+    #     :return: This method is an async iterable
+    #     '''
+    #     for id in this._managed_jobs:
+    #         try:
+    #             job_status = await this.get_transfer_status(id)
+    #             this._managed_jobs[id] = job_status
+    #             yield job_status
+    #         except KeyError:  # this is raised when either the job hasn't started yet OR has finished
+    #             ...
+    #         except ClientResponseError as err:
+    #             response = json.loads(err.message)
+    #             if response['error'] != "job not found": # this can happen when tthe job has finished for a while
+    #                 raise err
+    #
+    #
+    # @property
+    # async def jobs_in_progress(this) -> AsyncIterable[RCloneTransferJob]:
+    #     '''
+    #     Gets the list of all pending jobs
+    #
+    #     :return: This method is an async iterable
+    #     '''
+    #     async for job in this.started_jobs:
+    #         if job.status == RCJobStatus.IN_PROGRESS:
+    #             yield job
+    #
+    # @property
+    # async def terminated_jobs(this) -> AsyncIterable[RCloneTransferJob]:
+    #     '''
+    #     Gets the list of all terminated jobs (either successful or not)
+    #
+    #     :return: This method is an async iterable
+    #     '''
+    #
+    #     async for job in this.started_jobs:
+    #         if job.status != RCJobStatus.IN_PROGRESS:
+    #             yield job
+    #
+    def clean_terminated_jobs(this) -> Self:
         '''
         Clean the terminated jobs from the cache
 
         :return: This object
         '''
 
-        this._managed_jobs = [job.id async for job in this.jobs_in_progress]
+        id_to_remove = []
+
+        for jobid,last_updates in this._transferring_jobs_last_update.items():
+            if last_updates.status in [RCJobStatus.FINISHED,RCJobStatus.FAILED]:
+                id_to_remove.append(jobid)
+
+        for jobid in id_to_remove:
+            del this._transferring_jobs_last_update[jobid]
+            this._transferring_jobs.remove(jobid)
+
         return this
 
     async def stop_job(this, jobid: int) -> bool:
@@ -357,7 +452,7 @@ class rclone:
         '''
         response = await this.make_request("job", "stop", jobid=jobid)
 
-        return response.status == 200
+        return response['status'] == 200
 
     async def stop_pending_jobs(this) -> Self:
         '''
@@ -365,19 +460,20 @@ class rclone:
 
         :return: This object
         '''
-        async for job in this.jobs_in_progress:
-            await this.stop_job(job.id)
+        async for id,status in this.jobs:
+            if status in [RCJobStatus.NOT_STARTED, RCJobStatus.IN_PROGRESS]:
+                await this.stop_job(id)
 
         return this
-
-    async def get_pending_jobs_progress(this) -> RCloneTransferDetails:
-        '''
-        Returns an agglomerate statistics of all pending jobs
-        :return: This information is managed within the class RCloneTransferDetails
-        '''
-
-        jobs = [job async for job in this.started_jobs]
-        return RCloneTransferDetails(jobs)
+    #
+    # async def get_pending_jobs_progress(this) -> RCloneTransferDetails:
+    #     '''
+    #     Returns an agglomerate statistics of all pending jobs
+    #     :return: This information is managed within the class RCloneTransferDetails
+    #     '''
+    #
+    #     jobs = [job async for job in this.started_jobs]
+    #     return RCloneTransferDetails(jobs)
 
     def run(this) -> Self:
         '''
@@ -402,6 +498,14 @@ class rclone:
         )
 
         return this
+
+    async def is_ready(this) -> bool:
+        try:
+            await this.make_request("rc","noop")
+            return True
+        except ClientConnectorError:
+            return False
+
 
     def kill(this) -> Self:
         '''

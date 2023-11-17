@@ -35,24 +35,26 @@ def _fix_isotime(time: str) -> str:
     # Returns a new string with fixed timestamp
     return time
 
-@dataclass(frozen=True)
+@dataclass
 class RCloneJob:
     '''
     This class contains information related to any job
     '''
 
     id: int
+    duration:float
     startTime: datetime
     endTime: Union[datetime | None]
     error: str = ""
     output: Union[str | None] = None
     finished:bool=False
     success:bool=False
+    stats:Union[RCloneJobStats|None] = None
 
     @property
     def status(this) -> RCJobStatus:
         if (not this.finished) and (not this.success):
-            return RCJobStatus.IN_PROGRESS
+            return RCJobStatus.IN_PROGRESS if this.stats is not None else RCJobStatus.NOT_STARTED
         elif this.success:
             return RCJobStatus.FINISHED
         else:
@@ -62,8 +64,9 @@ class RCloneJob:
     def _get_data_from_json(cls, json_data:Dict) -> Dict[str|Any]:
         return {
         "id": json_data['id'],
+        "duration": json_data['duration'],
         "startTime":  datetime.fromisoformat(_fix_isotime(json_data['startTime'])),
-        "endTime":  datetime.fromisoformat(_fix_isotime(json_data['endTime'])),
+        "endTime":  datetime.fromisoformat(_fix_isotime(json_data['endTime'])) if json_data['endTime'] != 0 else None,
         "error":  json_data['error'],
         "output":  json_data['output'],
         "success":  json_data['success'],
@@ -74,9 +77,8 @@ class RCloneJob:
         d = cls._get_data_from_json(json_data)
         return cls(**d)
 
-
 @dataclass(frozen=True)
-class RCloneTransferJob(RCloneJob):
+class RCloneJobStats:
     '''
     This class collects detailed information about a job that is transferring a file
     '''
@@ -92,15 +94,18 @@ class RCloneTransferJob(RCloneJob):
         return this.transferred_bytes/this.size
 
     @classmethod
+    def from_json(cls, json_data:Dict) -> RCloneJobStats:
+        d = cls._get_data_from_json(json_data)
+        return cls(**d)
+
+    @classmethod
     def _get_data_from_json(cls, json_data: Dict) -> Dict[str | Any]:
-        job_data = super(RCloneTransferJob,cls)._get_data_from_json(json_data)
         return {
-            "transferred_bytes" : json_data.pop('bytes'),
-            "filename" : json_data.pop('name'),
-            "size" : json_data.pop('size'),
-            "speed" : json_data.pop('speed'),
-            "average_speed" : json_data.pop('speedAvg'),
-            **job_data
+            "transferred_bytes" : json_data['bytes'],
+            "filename" : json_data['name'],
+            "size" : json_data['size'],
+            "speed" : json_data['speed'],
+            "average_speed" : json_data['speedAvg'],
         }
 
 
@@ -109,12 +114,12 @@ class RCloneTransferDetails:
     This object collects the transfer information of many jobs, making easy to gather global information
     '''
 
-    def __init__(this, jobs:List[RCloneTransferJob]):
+    def __init__(this, jobs:List[RCloneJobStats]):
         this._jobs=jobs
 
     def __len__(this) -> int:
         return len(this._jobs)
-    def __getitem__(this, index:int) -> RCloneTransferJob:
+    def __getitem__(this, index:int) -> RCloneJobStats:
         '''
         Return the job at the provided position
         :param index: Job index
@@ -123,7 +128,7 @@ class RCloneTransferDetails:
 
         return this._jobs[index]
 
-    def __iter__(this) -> Iterable[RCloneTransferJob]:
+    def __iter__(this) -> Iterable[RCloneJobStats]:
         return iter(this._jobs)
 
     @property
