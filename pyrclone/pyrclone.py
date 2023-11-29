@@ -3,7 +3,7 @@ import asyncio
 from typing_extensions import Self, AsyncIterable
 from typing import Union, Tuple, Any, List, Dict
 from subprocess import Popen, PIPE
-from aiohttp import ClientSession, BasicAuth, ClientResponseError
+from aiohttp import ClientSession, BasicAuth, ClientResponseError, ClientTimeout
 from aiohttp.client_exceptions import ClientConnectorError
 from .auth import RCloneAuthenticator
 from .jobs import RCloneJob, RCloneJobStats, RCJobStatus
@@ -66,7 +66,7 @@ class rclone:
         :return: A ClientSession object
         '''
         if this._session is None:
-            args = {"base_url": f"http://{this._address}:{this._port}"}
+            args = {"base_url": f"http://{this._address}:{this._port}", "timeout":ClientTimeout(total=10)}
 
             if this._auth is not None:
                 auth = BasicAuth(login=this._auth.username, password=this._auth.passoword)
@@ -264,18 +264,33 @@ class rclone:
     @property
     async def jobs(this) -> AsyncIterable[Tuple[int,RCJobStatus]]:
 
+        rclone_current_jobs = await this.get_rclone_job_ids()
+
         for jobid in this._transferring_jobs:
-            this._transferring_jobs_last_update.setdefault(jobid,None)
 
-            try:
-                job_status = await this.get_job_status(jobid)
-                this._transferring_jobs_last_update[jobid] = job_status.stats
-            except ClientResponseError:
-                job_status = this._transferring_jobs_last_update[jobid]
+            if jobid in rclone_current_jobs:
+                this._transferring_jobs_last_update.setdefault(jobid,None)
 
-            status = job_status.status
+                try:
+                    job_status = await this.get_job_status(jobid)
+                    this._transferring_jobs_last_update[jobid] = job_status
+                except (ClientResponseError,asyncio.TimeoutError):
+                    ...
+                    #job_status = this._transferring_jobs_last_update[jobid]
+
+            job_status = this._transferring_jobs_last_update[jobid]
+
+            if job_status is not None:
+                status = job_status.status
+            else:
+                status = RCJobStatus.NOT_STARTED
 
             yield jobid,status
+
+    async def get_rclone_job_ids(this) -> List[int]:
+        request = await this.make_request("job","list")
+
+        return [int(x) for x in request['jobids']]
 
 
 
