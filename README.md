@@ -6,7 +6,7 @@ A python library wrapping some [rclone](https://rclone.org/) functionality to be
 **This is a work-in-progress library** and currently not available through PIP. You are welcome to download and use it in your own projects (please read carefully licence and disclaimer).
 
 ## ⚙️Current Exposed Functionality
-PyRclone does not provide use all the functionality that can be accessed via the rc API provided by rclone. Currently, the main exposed features are:
+PyRclone does not currently provide use all the functionality that could be accessed via the `rc` API provided by rclone. Currently, the main exposed features are:
 
 - User authentication via HTTP protocol (optional)
 - List of the configured rclone remotes
