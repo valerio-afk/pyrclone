@@ -51,6 +51,8 @@ class rclone:
         this._transferring_jobs:List[int] = []
         this._transferring_jobs_last_update:Dict[int,Union[RCloneJob|None]] = dict()
 
+        # this._debug = open('debug.txt','w')
+
     async def __aenter__(this) -> Self:
         this.run()
         return this
@@ -87,9 +89,14 @@ class rclone:
         :param kwargs: Anything supported by backend/command
         :return: A dictionary representing the json response provided by RClone
         '''
+        # this._debug.write(f"\nMaking request {backend}/{command}\n")
+        # this._debug.write(f"Args {kwargs}\n")
+
         async with this._http_session.post(f"/{backend}/{command}", ssl=False, json=kwargs) as response:
+
             content = await response.text(encoding="utf-8")
             if response.status == 200:
+                # this._debug.write(f"Response {content}\n")
                 return json.loads(content)
             else:
                 raise ClientResponseError(response.request_info, response.history, message=content)
@@ -396,10 +403,14 @@ class rclone:
 
         :return: The object itself
         '''
+
+
         cmd = [
             this._cmd,
             "rcd",
-            "--rc-addr", f"{this._address}:{this._port}"
+            "--rc-addr", f"{this._address}:{this._port}",
+            "--log-level", "INFO",
+            "--log-file", "rclone.log"
         ]
 
         if (this._auth is None):
